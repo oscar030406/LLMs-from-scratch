@@ -1,7 +1,15 @@
-﻿import os
+import os
+import argparse
+import contextlib
+import gc
+import io
 import json
 import math
+import re
+import sys
+import time
 import zipfile
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import tiktoken
 import numpy as np
@@ -11,6 +19,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+
+
+GPT2_BASE_CONFIG = {
+    "vocab_size": 50257,
+    "context_length": 1024,
+    "drop_rate": 0.0,
+    "qkv_bias": True,
+}
+
+GPT2_MODEL_CONFIGS = {
+    "gpt2-small (124M)": {"emb_dim": 768, "n_layers": 12, "n_heads": 12},
+    "gpt2-medium (355M)": {"emb_dim": 1024, "n_layers": 24, "n_heads": 16},
+    "gpt2-large (774M)": {"emb_dim": 1280, "n_layers": 36, "n_heads": 20},
+    "gpt2-xl (1558M)": {"emb_dim": 1600, "n_layers": 48, "n_heads": 25},
+}
+
+GPT2_REQUIRED_FILES = [
+    "checkpoint",
+    "encoder.json",
+    "hparams.json",
+    "model.ckpt.data-00000-of-00001",
+    "model.ckpt.index",
+    "model.ckpt.meta",
+    "vocab.bpe",
+]
 
 
 class GPTDatasetV1(Dataset):
@@ -861,16 +894,8 @@ def generate_instruction_response(
     return extract_instruction_response(generated_text, prompt)
 
 
-def main():
-    import argparse
-    import contextlib
-    import gc
-    import io
-    import re
-    import sys
-    import time
-    from importlib.util import module_from_spec, spec_from_file_location
-
+def configure_runtime():
+    """设置运行时输出，减少 TensorFlow 导入时的无关日志。"""
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -878,137 +903,88 @@ def main():
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
     os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
-    practice_dir = Path(__file__).resolve().parent
-    repo_root = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description="Chapter summary script for LLMs from scratch.")
-    parser.add_argument("--models-dir", type=Path, default=practice_dir / "gpt2")
-    parser.add_argument("--spam-data-dir", type=Path, default=practice_dir / "spam_data")
-    parser.add_argument("--output-dir", type=Path, default=practice_dir / "outputs")
-    parser.add_argument("--ch06-epochs", type=int, default=5)
-    parser.add_argument("--ch07-epochs", type=int, default=2)
-    parser.add_argument("--use-lora", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--max-new-tokens", type=int, default=128)
-    parser.add_argument("--eval-model", default="llama3.1:8b")
-    parser.add_argument("--skip-ollama-eval", action="store_true")
-    args = parser.parse_args()
+
+def resolve_project_root():
+    """从当前文件位置定位仓库根目录，避免写死任何本机路径。"""
+    return Path(__file__).resolve().parents[1]
+
+
+def parse_args(project_root):
+    """解析命令行参数；默认路径全部放在 practice/ 下。"""
+    practice_dir = project_root / "practice"
+    parser = argparse.ArgumentParser(description="LLMs-from-scratch 全链路复现脚本。")
+    parser.add_argument("--models-dir", type=Path, default=practice_dir / "gpt2", help="GPT-2 权重目录。")
+    parser.add_argument("--spam-data-dir", type=Path, default=practice_dir / "spam_data", help="短信分类数据目录。")
+    parser.add_argument("--output-dir", type=Path, default=practice_dir / "outputs", help="生成结果和模型保存目录。")
+    parser.add_argument("--ch06-epochs", type=int, default=5, help="第 6 章分类微调 epoch 数。")
+    parser.add_argument("--ch07-epochs", type=int, default=2, help="第 7 章指令微调 epoch 数。")
+    parser.add_argument("--use-lora", action=argparse.BooleanOptionalAction, default=True, help="是否使用 Appendix E 的 LoRA。")
+    parser.add_argument("--max-new-tokens", type=int, default=128, help="指令微调后每条测试样本最多生成 token 数。")
+    parser.add_argument("--eval-model", default="llama3.1:8b", help="Ollama 评估模型名称。")
+    parser.add_argument("--skip-ch06", action="store_true", help="跳过第 6 章分类微调。")
+    parser.add_argument("--skip-ch07", action="store_true", help="跳过第 7 章指令微调。")
+    parser.add_argument("--skip-ollama-eval", action="store_true", help="跳过本地 Ollama/Llama 评估。")
+    return parser.parse_args()
+
+
+def ensure_runtime_dirs(args):
+    """创建脚本运行需要的本地缓存目录。"""
     args.models_dir.mkdir(parents=True, exist_ok=True)
     args.spam_data_dir.mkdir(parents=True, exist_ok=True)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = tiktoken.get_encoding("gpt2")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    base_config = {
-        "vocab_size": 50257,
-        "context_length": 1024,
-        "drop_rate": 0.0,
-        "qkv_bias": True,
-    }
-    model_configs = {
-        "gpt2-small (124M)": {"emb_dim": 768, "n_layers": 12, "n_heads": 12},
-        "gpt2-medium (355M)": {"emb_dim": 1024, "n_layers": 24, "n_heads": 16},
-        "gpt2-large (774M)": {"emb_dim": 1280, "n_layers": 36, "n_heads": 20},
-        "gpt2-xl (1558M)": {"emb_dim": 1600, "n_layers": 48, "n_heads": 25},
-    }
-    gpt2_files = [
-        "checkpoint",
-        "encoder.json",
-        "hparams.json",
-        "model.ckpt.data-00000-of-00001",
-        "model.ckpt.index",
-        "model.ckpt.meta",
-        "vocab.bpe",
-    ]
+def local_gpt2_files_ready(model_dir):
+    return all((model_dir / name).exists() and (model_dir / name).stat().st_size > 0 for name in GPT2_REQUIRED_FILES)
 
-    def local_gpt2_files_ready(model_dir):
-        return all((model_dir / name).exists() and (model_dir / name).stat().st_size > 0 for name in gpt2_files)
 
-    def load_pretrained_gpt2(choose_model):
-        config = base_config.copy()
-        config.update(model_configs[choose_model])
-        model_size = choose_model.split(" ")[-1].lstrip("(").rstrip(")")
-        model_dir = args.models_dir / model_size
+def import_gpt_download_module(project_root):
+    """复用第 5 章下载脚本；导入时屏蔽其下载检查日志。"""
+    gpt_download_path = project_root / "ch05" / "01_main-chapter-code" / "gpt_download.py"
+    spec = spec_from_file_location("ch05_gpt_download", gpt_download_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot import {gpt_download_path}")
 
-        gpt_download_path = repo_root / "ch05" / "01_main-chapter-code" / "gpt_download.py"
-        spec = spec_from_file_location("ch05_gpt_download", gpt_download_path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Cannot import {gpt_download_path}")
+    module = module_from_spec(spec)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        spec.loader.exec_module(module)
+    return module
 
-        gpt_download = module_from_spec(spec)
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            spec.loader.exec_module(gpt_download)
-            if local_gpt2_files_ready(model_dir):
-                settings = json.loads((model_dir / "hparams.json").read_text(encoding="utf-8"))
-                params = gpt_download.load_gpt2_params_from_tf_ckpt(str(model_dir / "model.ckpt"), settings)
-            else:
-                settings, params = gpt_download.download_and_load_gpt2(
-                    model_size=model_size,
-                    models_dir=args.models_dir,
-                )
 
-        model = GPTModel(config)
-        load_weights_into_gpt(model, params)
-        model.to(device)
-        return model, config, settings
+def load_pretrained_gpt2(choose_model, models_dir, project_root, device):
+    """从本地加载 GPT-2 权重；缺失时才触发下载。"""
+    config = GPT2_BASE_CONFIG.copy()
+    config.update(GPT2_MODEL_CONFIGS[choose_model])
 
-    def free_model(model):
-        del model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    model_size = choose_model.split(" ")[-1].lstrip("(").rstrip(")")
+    model_dir = models_dir / model_size
+    gpt_download = import_gpt_download_module(project_root)
 
-    def query_ollama(prompt, model_name, url="http://localhost:11434/api/chat"):
-        data = {
-            "model": model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "options": {
-                "seed": 123,
-                "temperature": 0,
-                "num_ctx": 2048,
-            },
-        }
-        response_text = ""
-        with requests.post(url, json=data, stream=True, timeout=120) as response:
-            response.raise_for_status()
-            for line in response.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
-                response_json = json.loads(line)
-                if "message" in response_json:
-                    response_text += response_json["message"]["content"]
-        return response_text
-
-    def evaluate_instruction_responses(json_data, model_name):
-        scores = []
-        print("Ollama evaluation model:", model_name)
-        for index, entry in enumerate(json_data, start=1):
-            if entry["model_response"] == "":
-                scores.append(0)
-                continue
-
-            prompt = (
-                f"Given the input `{format_instruction_input(entry)}` "
-                f"and correct output `{entry['output']}`, "
-                f"score the model response `{entry['model_response']}` "
-                f"on a scale from 0 to 100, where 100 is the best score. "
-                f"Respond with the integer number only."
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        if local_gpt2_files_ready(model_dir):
+            settings = json.loads((model_dir / "hparams.json").read_text(encoding="utf-8"))
+            params = gpt_download.load_gpt2_params_from_tf_ckpt(str(model_dir / "model.ckpt"), settings)
+        else:
+            settings, params = gpt_download.download_and_load_gpt2(
+                model_size=model_size,
+                models_dir=models_dir,
             )
-            score_text = query_ollama(prompt, model_name).strip()
-            try:
-                scores.append(int(score_text))
-            except ValueError:
-                print(f"Could not convert score for entry {index}: {score_text}")
 
-            if index % 10 == 0:
-                print(f"Scored {index}/{len(json_data)} entries")
+    model = GPTModel(config)
+    load_weights_into_gpt(model, params)
+    return model.to(device), config, settings
 
-        return scores
 
-    print("Device:", device)
-    print("=" * 50)
+def release_model(model):
+    """释放当前模型，给后续章节训练腾出显存。"""
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    print("Chapter 6: GPT-2 small spam classification")
-    data_dir = args.spam_data_dir
+
+def prepare_spam_data(data_dir):
+    """准备第 6 章短信垃圾分类数据集。"""
     data_file_path = data_dir / "SMSSpamCollection.tsv"
     zip_path = data_dir / "sms_spam_collection.zip"
 
@@ -1030,129 +1006,142 @@ def main():
     spam_df = pd.read_csv(data_file_path, sep="\t", header=None, names=["Label", "Text"])
     spam_df = create_balanced_dataset(spam_df)
     spam_df["Label"] = spam_df["Label"].map({"ham": 0, "spam": 1})
-    train_df, val_df, test_df = random_split(spam_df, train_frac=0.7, validation_frac=0.1)
+    return random_split(spam_df, train_frac=0.7, validation_frac=0.1)
 
+
+def build_spam_loaders(train_df, val_df, test_df, tokenizer, batch_size=8):
+    """把短信分类 DataFrame 转成 PyTorch DataLoader。"""
     train_dataset = SpamDataset(train_df, tokenizer)
     val_dataset = SpamDataset(val_df, tokenizer, max_length=train_dataset.max_length)
     test_dataset = SpamDataset(test_df, tokenizer, max_length=train_dataset.max_length)
 
-    ch06_model_name = "gpt2-small (124M)"
-    ch06_model, ch06_config, _ = load_pretrained_gpt2(ch06_model_name)
-    assert train_dataset.max_length <= ch06_config["context_length"]
-    print("Loaded model:", ch06_model_name)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=0)
+    return train_dataset, val_dataset, test_dataset, train_loader, val_loader, test_loader
+
+
+def run_spam_classification(args, tokenizer, device, project_root):
+    """第 6 章：在 GPT-2 small 上做二分类微调。"""
+    print("Chapter 6: GPT-2 small spam classification")
+    train_df, val_df, test_df = prepare_spam_data(args.spam_data_dir)
+    train_dataset, val_dataset, test_dataset, train_loader, val_loader, test_loader = build_spam_loaders(
+        train_df, val_df, test_df, tokenizer
+    )
+
+    model_name = "gpt2-small (124M)"
+    model, config, _ = load_pretrained_gpt2(model_name, args.models_dir, project_root, device)
+    assert train_dataset.max_length <= config["context_length"]
+    print("Loaded model:", model_name)
     print("Training set length:", len(train_dataset))
     print("Validation set length:", len(val_dataset))
     print("Test set length:", len(test_dataset))
 
-    train_loader_cls = DataLoader(train_dataset, batch_size=8, shuffle=True, drop_last=True, num_workers=0)
-    val_loader_cls = DataLoader(val_dataset, batch_size=8, shuffle=False, drop_last=False, num_workers=0)
-    test_loader_cls = DataLoader(test_dataset, batch_size=8, shuffle=False, drop_last=False, num_workers=0)
-
     torch.manual_seed(123)
-    ch06_model = prepare_model_for_classification(
-        model=ch06_model,
-        emb_dim=ch06_config["emb_dim"],
-        num_classes=2,
-        train_last_block=True,
-    )
-    ch06_model.to(device)
+    model = prepare_model_for_classification(model=model, emb_dim=config["emb_dim"], num_classes=2)
+    model.to(device)
 
     print("Initial accuracies")
-    print("   Training accuracy:", calc_classification_accuracy_loader(train_loader_cls, ch06_model, device, num_batches=10))
-    print("   Validation accuracy:", calc_classification_accuracy_loader(val_loader_cls, ch06_model, device, num_batches=10))
-    print("   Test accuracy:", calc_classification_accuracy_loader(test_loader_cls, ch06_model, device, num_batches=10))
+    print("   Training accuracy:", calc_classification_accuracy_loader(train_loader, model, device, num_batches=10))
+    print("   Validation accuracy:", calc_classification_accuracy_loader(val_loader, model, device, num_batches=10))
+    print("   Test accuracy:", calc_classification_accuracy_loader(test_loader, model, device, num_batches=10))
 
     start_time = time.time()
-    optimizer = torch.optim.AdamW(ch06_model.parameters(), lr=5e-5, weight_decay=0.1)
-    train_classifier_simple(
-        model=ch06_model,
-        train_loader=train_loader_cls,
-        val_loader=val_loader_cls,
-        optimizer=optimizer,
-        device=device,
-        num_epochs=args.ch06_epochs,
-        eval_freq=50,
-        eval_iter=5,
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.1)
+    train_classifier_simple(model, train_loader, val_loader, optimizer, device, args.ch06_epochs, eval_freq=50, eval_iter=5)
     print(f"Training completed in {(time.time() - start_time) / 60:.2f} minutes.")
 
     print("Final accuracies")
-    print("   Training accuracy:", calc_classification_accuracy_loader(train_loader_cls, ch06_model, device))
-    print("   Validation accuracy:", calc_classification_accuracy_loader(val_loader_cls, ch06_model, device))
-    print("   Test accuracy:", calc_classification_accuracy_loader(test_loader_cls, ch06_model, device))
-    print("=" * 50)
-    free_model(ch06_model)
+    print("   Training accuracy:", calc_classification_accuracy_loader(train_loader, model, device))
+    print("   Validation accuracy:", calc_classification_accuracy_loader(val_loader, model, device))
+    print("   Test accuracy:", calc_classification_accuracy_loader(test_loader, model, device))
+    release_model(model)
 
-    print("Chapter 7: GPT-2 medium instruction finetuning")
-    instruction_path = repo_root / "ch07" / "01_main-chapter-code" / "instruction-data.json"
+
+def load_instruction_splits(project_root):
+    """读取第 7 章指令数据，并切分 train/val/test。"""
+    instruction_path = project_root / "ch07" / "01_main-chapter-code" / "instruction-data.json"
     instruction_data = download_and_load_json_file(
         instruction_path,
         url="https://raw.githubusercontent.com/rasbt/LLMs-from-scratch/main/ch07/01_main-chapter-code/instruction-data.json",
     )
-    train_data, val_data, test_data = split_instruction_data(instruction_data)
+    return split_instruction_data(instruction_data)
+
+
+def build_instruction_loaders(train_data, val_data, tokenizer, config, device, batch_size=8):
+    """构造指令微调 DataLoader，collate_fn 会完成 padding 和 mask。"""
+    train_dataset = InstructionDataset(train_data, tokenizer)
+    val_dataset = InstructionDataset(val_data, tokenizer)
+
+    def collate(batch):
+        return instruction_collate_fn(batch, allowed_max_length=config["context_length"], device=device)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=0, collate_fn=collate)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=0, collate_fn=collate)
+    return train_loader, val_loader
+
+
+def clean_instruction_response(generated_text, prompt):
+    response_text = generated_text[len(prompt) :].replace("### Response:", "").strip()
+    response_text = response_text.split("### Instruction:")[0].strip()
+    return response_text.split("<|endoftext|>")[0].strip()
+
+
+def generate_test_responses(test_data, model, tokenizer, device, config, max_new_tokens):
+    """对测试集生成回答，供后续本地 Llama/Ollama 评估。"""
+    print("Generating responses")
+    for entry in test_data:
+        input_text = format_instruction_input(entry)
+        token_ids = generate(
+            model=model,
+            idx=text_to_token_ids(input_text, tokenizer).to(device),
+            max_new_tokens=max_new_tokens,
+            context_size=config["context_length"],
+            eos_id=50256,
+        )
+        generated_text = token_ids_to_text(token_ids.cpu(), tokenizer)
+        entry["model_response"] = clean_instruction_response(generated_text, input_text)
+    return test_data
+
+
+def run_instruction_finetuning(args, tokenizer, device, project_root):
+    """第 7 章 + Appendix D/E：指令微调，可选 LoRA。"""
+    print("Chapter 7: GPT-2 medium instruction finetuning")
+    train_data, val_data, test_data = load_instruction_splits(project_root)
     print("Training set length:", len(train_data))
     print("Validation set length:", len(val_data))
     print("Test set length:", len(test_data))
 
-    ch07_model_name = "gpt2-medium (355M)"
-    ch07_model, ch07_config, _ = load_pretrained_gpt2(ch07_model_name)
-    ch07_model.eval()
-    print("Loaded model:", ch07_model_name)
+    model_name = "gpt2-medium (355M)"
+    model, config, _ = load_pretrained_gpt2(model_name, args.models_dir, project_root, device)
+    model.eval()
+    print("Loaded model:", model_name)
 
     if args.use_lora:
-        freeze_model_parameters(ch07_model)
-        replace_linear_with_lora(ch07_model, rank=16, alpha=16)
-        ch07_model.to(device)
+        freeze_model_parameters(model)
+        replace_linear_with_lora(model, rank=16, alpha=16)
+        model.to(device)
         print("Appendix E LoRA: enabled")
     else:
         print("Appendix E LoRA: disabled; full finetuning")
-    print(f"Total parameters: {count_parameters(ch07_model):,}")
-    print(f"Trainable parameters: {count_parameters(ch07_model, only_trainable=True):,}")
+    print(f"Total parameters: {count_parameters(model):,}")
+    print(f"Trainable parameters: {count_parameters(model, only_trainable=True):,}")
 
-    train_dataset_inst = InstructionDataset(train_data, tokenizer)
-    val_dataset_inst = InstructionDataset(val_data, tokenizer)
-    train_loader_inst = DataLoader(
-        train_dataset_inst,
-        batch_size=8,
-        shuffle=True,
-        drop_last=True,
-        num_workers=0,
-        collate_fn=lambda batch: instruction_collate_fn(
-            batch,
-            allowed_max_length=ch07_config["context_length"],
-            device=device,
-        ),
-    )
-    val_loader_inst = DataLoader(
-        val_dataset_inst,
-        batch_size=8,
-        shuffle=False,
-        drop_last=False,
-        num_workers=0,
-        collate_fn=lambda batch: instruction_collate_fn(
-            batch,
-            allowed_max_length=ch07_config["context_length"],
-            device=device,
-        ),
-    )
+    train_loader, val_loader = build_instruction_loaders(train_data, val_data, tokenizer, config, device)
 
     print("Initial losses")
     with torch.no_grad():
-        print("   Training loss:", calc_loss_loader(train_loader_inst, ch07_model, device, num_batches=5))
-        print("   Validation loss:", calc_loss_loader(val_loader_inst, ch07_model, device, num_batches=5))
+        print("   Training loss:", calc_loss_loader(train_loader, model, device, num_batches=5))
+        print("   Validation loss:", calc_loss_loader(val_loader, model, device, num_batches=5))
 
     start_time = time.time()
-    optimizer = torch.optim.AdamW(
-        (param for param in ch07_model.parameters() if param.requires_grad),
-        lr=5e-5,
-        weight_decay=0.1,
-    )
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=5e-5, weight_decay=0.1)
     torch.manual_seed(123)
-    warmup_steps = max(1, int(0.2 * len(train_loader_inst) * args.ch07_epochs))
+    warmup_steps = max(1, int(0.2 * len(train_loader) * args.ch07_epochs))
     train_model_with_appendix_d(
-        model=ch07_model,
-        train_loader=train_loader_inst,
-        val_loader=val_loader_inst,
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
         optimizer=optimizer,
         device=device,
         num_epochs=args.ch07_epochs,
@@ -1168,32 +1157,68 @@ def main():
     )
     print(f"Training completed in {(time.time() - start_time) / 60:.2f} minutes.")
 
-    print("Generating responses")
-    for entry in test_data:
-        input_text = format_instruction_input(entry)
-        token_ids = generate(
-            model=ch07_model,
-            idx=text_to_token_ids(input_text, tokenizer).to(device),
-            max_new_tokens=args.max_new_tokens,
-            context_size=ch07_config["context_length"],
-            eos_id=50256,
-        )
-        generated_text = token_ids_to_text(token_ids.cpu(), tokenizer)
-        response_text = generated_text[len(input_text) :].replace("### Response:", "").strip()
-        response_text = response_text.split("### Instruction:")[0].strip()
-        response_text = response_text.split("<|endoftext|>")[0].strip()
-        entry["model_response"] = response_text
-
+    test_data = generate_test_responses(test_data, model, tokenizer, device, config, args.max_new_tokens)
     responses_path = args.output_dir / "instruction-data-with-response-standalone.json"
     with open(responses_path, "w", encoding="utf-8") as file:
         json.dump(test_data, file, indent=4, ensure_ascii=False)
     print(f"Responses saved as {responses_path}")
 
     suffix = "lora" if args.use_lora else "full"
-    model_path = args.output_dir / f"{re.sub(r'[ ()]', '', ch07_model_name)}-sft-{suffix}-standalone.pth"
-    torch.save(ch07_model.state_dict(), model_path)
+    model_path = args.output_dir / f"{re.sub(r'[ ()]', '', model_name)}-sft-{suffix}-standalone.pth"
+    torch.save(model.state_dict(), model_path)
     print(f"Model saved as {model_path}")
+    release_model(model)
+    return test_data
 
+
+def query_ollama(prompt, model_name, url="http://localhost:11434/api/chat"):
+    """调用本地 Ollama，对单条回答进行评分。"""
+    data = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "options": {"seed": 123, "temperature": 0, "num_ctx": 2048},
+    }
+    response_text = ""
+    with requests.post(url, json=data, stream=True, timeout=120) as response:
+        response.raise_for_status()
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            response_json = json.loads(line)
+            if "message" in response_json:
+                response_text += response_json["message"]["content"]
+    return response_text
+
+
+def evaluate_instruction_responses(json_data, model_name):
+    """用本地 Llama/Ollama 对指令微调结果打分。"""
+    scores = []
+    print("Ollama evaluation model:", model_name)
+    for index, entry in enumerate(json_data, start=1):
+        if entry["model_response"] == "":
+            scores.append(0)
+            continue
+
+        prompt = (
+            f"Given the input `{format_instruction_input(entry)}` "
+            f"and correct output `{entry['output']}`, "
+            f"score the model response `{entry['model_response']}` "
+            f"on a scale from 0 to 100, where 100 is the best score. "
+            f"Respond with the integer number only."
+        )
+        score_text = query_ollama(prompt, model_name).strip()
+        try:
+            scores.append(int(score_text))
+        except ValueError:
+            print(f"Could not convert score for entry {index}: {score_text}")
+
+        if index % 10 == 0:
+            print(f"Scored {index}/{len(json_data)} entries")
+    return scores
+
+
+def run_ollama_evaluation(args, test_data):
+    """如果本地 Ollama 可用，就执行书中类似的自动评估流程。"""
     if args.skip_ollama_eval:
         return
 
@@ -1209,6 +1234,29 @@ def main():
         print("Reason:", exc)
         print("Make sure Ollama is running and the model is pulled, for example: ollama pull llama3.1:8b")
 
+
+def main():
+    configure_runtime()
+
+    project_root = resolve_project_root()
+    args = parse_args(project_root)
+    ensure_runtime_dirs(args)
+
+    tokenizer = tiktoken.get_encoding("gpt2")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("Device:", device)
+    print("=" * 50)
+
+    # 第 6 章流程和第 7 章流程彼此独立；命令行参数可按需跳过。
+    if not args.skip_ch06:
+        run_spam_classification(args, tokenizer, device, project_root)
+
+    print("=" * 50)
+
+    if not args.skip_ch07:
+        test_data = run_instruction_finetuning(args, tokenizer, device, project_root)
+        run_ollama_evaluation(args, test_data)
 
 if __name__ == "__main__":
     main()
