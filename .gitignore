@@ -151,6 +151,12 @@ ch07/02_dataset-utilities/instruction-examples-modified.json
 ch07/04_preference-tuning-with-dpo/gpt2-medium355M-sft.pth
 ch07/04_preference-tuning-with-dpo/loss-plot.pdf
 
+practice/gpt2/
+practice/spam_data/
+practice/outputs/
+practice/*.pth
+practice/instruction-data-with-response*.json
+
 # Tokenizer files
 ch02/05_bpe-from-scratch/bpe_merges.txt
 ch02/05_bpe-from-scratch/encoder.json
